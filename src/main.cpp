@@ -5,8 +5,8 @@
 // Pokemon-Tausch/-Kampf), teilen sich eine globale Geschwindigkeitsregelung
 // (1x-4x) und einen Race-Timer.
 //
-// Die Lockstep-Verkabelung folgt 1:1 dem MultiplayerController des
-// offiziellen mGBA-Qt-Frontends (third_party/mgba/src/platform/qt).
+// Die Lockstep-Callbacks folgen dem MultiplayerController des
+// offiziellen mGBA-Qt-Frontends, mit kabel-lokaler Zuordnung der Spieler.
 
 #include <SDL.h>
 
@@ -33,6 +33,11 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <array>
+#include <map>
+
 #include <mutex>
 #include <string>
 #include <vector>
@@ -41,6 +46,7 @@ namespace fs = std::filesystem;
 
 #include "font5x7.h"
 #include "lang.h"
+#include "session.h"
 
 static_assert(sizeof(color_t) == 4, "libmgba muss ohne COLOR_16_BIT gebaut sein");
 
@@ -82,12 +88,25 @@ struct Player {
 	uint16_t padKeys = 0;
 };
 
-struct App {
+struct LinkGroup {
 	union {
 		struct mLockstep lockstep;
 		struct GBASIOLockstep gbaLockstep;
 	};
-	std::mutex lockstepMutex;
+	std::mutex mutex;
+	std::vector<int> screens;
+};
+
+struct App {
+	LinkGroup cables[2];
+	int cableCount = 0;
+	int linkMode = 2; // 0 off, 1 pair, 2 all, 3 two pairs
+	std::array<int, 4> cableProfiles = {0, 1, 2, 3};
+	std::array<int, 4> screenProfiles = {0, 1, 2, 3};
+	std::string profileName[4];
+	std::map<std::string, std::array<std::string, 4>> profileSaves;
+	bool profilesLoaded = false;
+
 	bool linked = false;
 	bool linkEnabled = true;
 
@@ -241,16 +260,17 @@ static void frameCallback(struct mCoreThread* thread) {
 // ---------------------------------------------------------------------------
 // Lockstep-Callbacks — direkte Uebersetzung von MultiplayerController.cpp
 
-static void lockstepLock(struct mLockstep*) {
-	g_app.lockstepMutex.lock();
+static void lockstepLock(struct mLockstep* link) {
+	static_cast<LinkGroup*>(link->context)->mutex.lock();
 }
 
-static void lockstepUnlock(struct mLockstep*) {
-	g_app.lockstepMutex.unlock();
+static void lockstepUnlock(struct mLockstep* link) {
+	static_cast<LinkGroup*>(link->context)->mutex.unlock();
 }
 
-static bool lockstepSignal(struct mLockstep*, unsigned mask) {
-	Player* player = &g_players[0];
+static bool lockstepSignal(struct mLockstep* link, unsigned mask) {
+	auto& group = *static_cast<LinkGroup*>(link->context);
+	Player* player = &g_players[group.screens[0]];
 	bool woke = false;
 	player->waitMask &= ~mask;
 	if (!player->waitMask && player->awake < 1) {
@@ -261,8 +281,9 @@ static bool lockstepSignal(struct mLockstep*, unsigned mask) {
 	return woke;
 }
 
-static bool lockstepWait(struct mLockstep*, unsigned mask) {
-	Player* player = &g_players[0];
+static bool lockstepWait(struct mLockstep* link, unsigned mask) {
+	auto& group = *static_cast<LinkGroup*>(link->context);
+	Player* player = &g_players[group.screens[0]];
 	bool slept = false;
 	player->waitMask |= mask;
 	if (player->awake > 0) {
@@ -274,13 +295,14 @@ static bool lockstepWait(struct mLockstep*, unsigned mask) {
 	return slept;
 }
 
-static void lockstepAddCycles(struct mLockstep*, int id, int32_t cycles) {
+static void lockstepAddCycles(struct mLockstep* link, int id, int32_t cycles) {
+	auto& group = *static_cast<LinkGroup*>(link->context);
 	if (cycles < 0) {
 		abort();
 	}
 	if (!id) {
-		for (int i = 1; i < g_app.numPlayers; ++i) {
-			Player* player = &g_players[i];
+		for (int i = 1; i < (int)group.screens.size(); ++i) {
+			Player* player = &g_players[group.screens[i]];
 			if (player->node->d.p->mode > SIO_MULTI) {
 				playerSetSync(player, true);
 				continue;
@@ -294,14 +316,15 @@ static void lockstepAddCycles(struct mLockstep*, int id, int32_t cycles) {
 			player->awake = 1;
 		}
 	} else {
-		Player* player = &g_players[id];
+		Player* player = &g_players[group.screens[id]];
 		playerSetSync(player, true);
 		player->cyclesPosted += cycles;
 	}
 }
 
-static int32_t lockstepUseCycles(struct mLockstep*, int id, int32_t cycles) {
-	Player* player = &g_players[id];
+static int32_t lockstepUseCycles(struct mLockstep* link, int id, int32_t cycles) {
+	auto& group = *static_cast<LinkGroup*>(link->context);
+	Player* player = &g_players[group.screens[id]];
 	player->cyclesPosted -= cycles;
 	if (player->cyclesPosted <= 0) {
 		mCoreThreadWaitFromThread(&player->thread);
@@ -310,28 +333,30 @@ static int32_t lockstepUseCycles(struct mLockstep*, int id, int32_t cycles) {
 	return player->cyclesPosted;
 }
 
-static int32_t lockstepUnusedCycles(struct mLockstep*, int id) {
-	return g_players[id].cyclesPosted;
+static int32_t lockstepUnusedCycles(struct mLockstep* link, int id) {
+	auto& group = *static_cast<LinkGroup*>(link->context);
+	return g_players[group.screens[id]].cyclesPosted;
 }
 
-static void lockstepUnload(struct mLockstep* lockstep, int id) {
+static void lockstepUnload(struct mLockstep* link, int id) {
+	auto& group = *static_cast<LinkGroup*>(link->context);
 	if (id) {
-		Player* player = &g_players[id];
+		Player* player = &g_players[group.screens[id]];
 		playerSetSync(player, true);
 		player->cyclesPosted = 0;
 
 		// Master freigeben, falls er auf diesen Spieler wartet
-		player = &g_players[0];
+		player = &g_players[group.screens[0]];
 		player->waitMask &= ~(1 << id);
 		if (!player->waitMask && player->awake < 1) {
 			mCoreThreadStopWaiting(&player->thread);
 			player->awake = 1;
 		}
 	} else {
-		for (int i = 1; i < g_app.numPlayers; ++i) {
-			Player* player = &g_players[i];
+		for (int i = 1; i < (int)group.screens.size(); ++i) {
+			Player* player = &g_players[group.screens[i]];
 			playerSetSync(player, true);
-			player->cyclesPosted += reinterpret_cast<struct GBASIOLockstep*>(lockstep)->players[0]->eventDiff;
+			player->cyclesPosted += group.gbaLockstep.players[0]->eventDiff;
 			if (player->awake < 1) {
 				player->node->nextEvent += player->cyclesPosted;
 				mCoreThreadStopWaiting(&player->thread);
@@ -354,54 +379,62 @@ static void continueAll() {
 }
 
 static void attachLink() {
-	if (g_app.numPlayers < 2 || !g_app.linkEnabled) {
-		return;
-	}
-	mLockstepInit(&g_app.lockstep);
-	g_app.lockstep.context = &g_app;
-	g_app.lockstep.lock = lockstepLock;
-	g_app.lockstep.unlock = lockstepUnlock;
-	g_app.lockstep.signal = lockstepSignal;
-	g_app.lockstep.wait = lockstepWait;
-	g_app.lockstep.addCycles = lockstepAddCycles;
-	g_app.lockstep.useCycles = lockstepUseCycles;
-	g_app.lockstep.unusedCycles = lockstepUnusedCycles;
-	g_app.lockstep.unload = lockstepUnload;
-	GBASIOLockstepInit(&g_app.gbaLockstep);
-
+	if (!g_app.linkEnabled) return;
+	auto groups = session::linkGroups(g_app.numPlayers, g_app.screenProfiles,
+	                                 g_app.linkMode, g_app.cableProfiles);
 	interruptAll();
-	for (int i = 0; i < g_app.numPlayers; ++i) {
-		Player* p = &g_players[i];
-		struct GBA* gba = static_cast<struct GBA*>(p->core->board);
-		p->node = new GBASIOLockstepNode();
-		GBASIOLockstepNodeCreate(p->node);
-		GBASIOLockstepAttachNode(&g_app.gbaLockstep, p->node);
-		GBASIOSetDriver(&gba->sio, &p->node->d, SIO_MULTI);
-		GBASIOSetDriver(&gba->sio, &p->node->d, SIO_NORMAL_32);
-	}
-	continueAll();
-	g_app.linked = true;
-}
-
-static void detachLink() {
-	if (!g_app.linked) {
-		return;
-	}
-	interruptAll();
-	for (int i = 0; i < g_app.numPlayers; ++i) {
-		Player* p = &g_players[i];
-		struct GBA* gba = static_cast<struct GBA*>(p->core->board);
-		GBASIOSetDriver(&gba->sio, nullptr, SIO_MULTI);
-		GBASIOSetDriver(&gba->sio, nullptr, SIO_NORMAL_32);
-		if (p->node) {
-			GBASIOLockstepDetachNode(&g_app.gbaLockstep, p->node);
-			delete p->node;
-			p->node = nullptr;
+	for (const auto& screens : groups) {
+		auto& group = g_app.cables[g_app.cableCount++];
+		group.screens = screens;
+		mLockstepInit(&group.lockstep);
+		group.lockstep.context = &group;
+		group.lockstep.lock = lockstepLock;
+		group.lockstep.unlock = lockstepUnlock;
+		group.lockstep.signal = lockstepSignal;
+		group.lockstep.wait = lockstepWait;
+		group.lockstep.addCycles = lockstepAddCycles;
+		group.lockstep.useCycles = lockstepUseCycles;
+		group.lockstep.unusedCycles = lockstepUnusedCycles;
+		group.lockstep.unload = lockstepUnload;
+		GBASIOLockstepInit(&group.gbaLockstep);
+		for (int screen : screens) {
+			Player& p = g_players[screen];
+			auto* gba = static_cast<struct GBA*>(p.core->board);
+			p.node = new GBASIOLockstepNode();
+			GBASIOLockstepNodeCreate(p.node);
+			GBASIOLockstepAttachNode(&group.gbaLockstep, p.node);
+			GBASIOSetDriver(&gba->sio, &p.node->d, SIO_MULTI);
+			GBASIOSetDriver(&gba->sio, &p.node->d, SIO_NORMAL_32);
 		}
 	}
 	continueAll();
+	g_app.linked = g_app.cableCount > 0;
+}
+
+static void detachLink() {
+	if (!g_app.linked) return;
+	interruptAll();
+	for (int cable = 0; cable < g_app.cableCount; ++cable) {
+		auto& group = g_app.cables[cable];
+		// Unload callbacks still consult the master's and peers' nodes. Keep all
+		// nodes alive until every driver on this cable has been disconnected.
+		for (int screen : group.screens) {
+			auto* gba = static_cast<struct GBA*>(g_players[screen].core->board);
+			GBASIOSetDriver(&gba->sio, nullptr, SIO_MULTI);
+			GBASIOSetDriver(&gba->sio, nullptr, SIO_NORMAL_32);
+		}
+		for (auto it = group.screens.rbegin(); it != group.screens.rend(); ++it) {
+			Player& p = g_players[*it];
+			GBASIOLockstepDetachNode(&group.gbaLockstep, p.node);
+			delete p.node;
+			p.node = nullptr;
+		}
+		mLockstepDeinit(&group.lockstep);
+		group.screens.clear();
+	}
+	g_app.cableCount = 0;
 	g_app.linked = false;
-	mLockstepDeinit(&g_app.lockstep);
+	continueAll();
 }
 
 // ---------------------------------------------------------------------------
@@ -480,15 +513,37 @@ static std::string baseName(const std::string& path) {
 	return slash == std::string::npos ? path : path.substr(slash + 1);
 }
 
-static std::string savePathFor(const Player& p, int index, bool dupRom) {
-	if (!dupRom) {
-		return "";  // Standard: .sav neben dem ROM (mCoreAutoloadSave)
+static std::string romKey(const std::string& rom) {
+	return fs::weakly_canonical(fs::absolute(rom)).generic_string();
+}
+
+static void registerProfileSaves(const std::string& rom) {
+	std::string key = romKey(rom);
+	if (g_app.profileSaves.count(key)) return;
+	std::array<std::string, 4> saves;
+	for (int profile = 0; profile < 4; ++profile)
+		saves[profile] = stripExtension(key) + ".p" + std::to_string(profile + 1) + ".sav";
+	// A legacy single-ROM save belongs to the original screen/profile.
+	int owner = 0;
+	for (int i = 0; i < 4; ++i) {
+		if (!g_app.savedRomPath[i].empty() && romKey(g_app.savedRomPath[i]) == key) {
+			owner = i;
+			break;
+		}
 	}
-	return stripExtension(p.romPath) + ".p" + std::to_string(index + 1) + ".sav";
+	std::string plain = stripExtension(key) + ".sav";
+	if (fs::exists(plain) && !fs::exists(saves[owner])) saves[owner] = plain;
+	g_app.profileSaves[key] = saves;
+}
+
+static std::string savePathFor(const Player& p, int index, bool) {
+	registerProfileSaves(p.romPath);
+	return g_app.profileSaves.at(romKey(p.romPath))[g_app.screenProfiles[index]];
 }
 
 static std::string statePathFor(const Player& p, int index) {
-	return stripExtension(p.romPath) + ".p" + std::to_string(index + 1) + ".ss1";
+	return stripExtension(p.romPath) + ".p" +
+	       std::to_string(g_app.screenProfiles[index] + 1) + ".ss1";
 }
 
 static bool bootPlayer(Player& p, int index, const std::string& rom, bool dupRom) {
@@ -535,8 +590,9 @@ static bool bootPlayer(Player& p, int index, const std::string& rom, bool dupRom
 		mCoreAutoloadSave(p.core);
 	} else {
 		struct VFile* sav = VFileOpen(savPath.c_str(), O_CREAT | O_RDWR);
-		if (sav) {
-			p.core->loadSave(p.core, sav);
+		if (!sav || !p.core->loadSave(p.core, sav)) {
+			fprintf(stderr, "Cannot open profile save: %s\n", savPath.c_str());
+			return false;
 		}
 	}
 
@@ -881,6 +937,93 @@ static std::string legacySettingsPath() {
 #endif
 }
 
+static std::string profilesPath() { return settingsPath() + ".profiles"; }
+
+static bool loadProfiles() {
+	for (int i = 0; i < 4; ++i) {
+		g_app.profileName[i] = g_app.playerName[i].empty()
+		    ? "SAVE " + std::to_string(i + 1) : g_app.playerName[i];
+	}
+	std::string path = profilesPath();
+	if (!fs::exists(path) && fs::exists(path + ".bak")) path += ".bak";
+	std::ifstream in(path);
+	if (fs::exists(path) && !in) return false;
+	unsigned profiles = 0;
+	bool screensSeen = false, cableSeen = false;
+	std::string kind;
+	while (in >> kind) {
+		if (kind == "profile") {
+			int id; std::string name;
+			if (!(in >> id >> std::quoted(name)) || id < 0 || id > 3 || name.empty()) return false;
+			profiles |= 1u << id;
+			g_app.profileName[id] = name.substr(0, 10);
+		} else if (kind == "screens") {
+			std::array<int, 4> ids;
+			if (!(in >> ids[0] >> ids[1] >> ids[2] >> ids[3]) || !session::isPermutation(ids)) return false;
+			screensSeen = true;
+			g_app.screenProfiles = ids;
+		} else if (kind == "cable") {
+			int mode; std::array<int, 4> ids;
+			if (!(in >> mode >> ids[0] >> ids[1] >> ids[2] >> ids[3]) || mode < 0 || mode > 3 || !session::isPermutation(ids)) return false;
+			cableSeen = true;
+			g_app.linkMode = mode; g_app.cableProfiles = ids;
+		} else if (kind == "save") {
+			std::string rom; std::array<std::string, 4> paths;
+			if (!(in >> std::quoted(rom) >> std::quoted(paths[0]) >> std::quoted(paths[1])
+			         >> std::quoted(paths[2]) >> std::quoted(paths[3]))) return false;
+			for (int i = 0; i < 4; ++i) {
+				if (paths[i].empty() || !fs::path(paths[i]).is_absolute()) return false;
+				for (int j = 0; j < i; ++j) if (romKey(paths[i]) == romKey(paths[j])) return false;
+			}
+			g_app.profileSaves[rom] = paths;
+		} else { std::string rest; std::getline(in, rest); }
+	}
+	if (fs::exists(path) && (profiles != 15 || !screensSeen || !cableSeen || in.bad())) return false;
+	g_app.profilesLoaded = true;
+	return true;
+}
+
+static bool saveProfiles() {
+	if (!g_app.profilesLoaded) return true;
+	std::string path = profilesPath();
+	std::ofstream out(path + ".tmp");
+	for (int i = 0; i < 4; ++i)
+		out << "profile " << i << " " << std::quoted(g_app.profileName[i]) << "\n";
+	out << "screens";
+	for (int id : g_app.screenProfiles) out << " " << id;
+	out << "\ncable " << g_app.linkMode;
+	for (int id : g_app.cableProfiles) out << " " << id;
+	out << "\n";
+	for (const auto& entry : g_app.profileSaves) {
+		out << "save " << std::quoted(entry.first);
+		for (const auto& file : entry.second) out << " " << std::quoted(file);
+		out << "\n";
+	}
+	out.close();
+	if (!out) return false;
+	std::error_code ec;
+#ifdef _WIN32
+	// Windows rename does not replace existing files. Keep a recoverable backup.
+	if (fs::exists(path)) fs::copy_file(path, path + ".bak", fs::copy_options::overwrite_existing, ec);
+	if (ec) return false;
+	fs::remove(path, ec);
+	if (ec) return false;
+#endif
+	fs::rename(path + ".tmp", path, ec);
+	return !ec;
+}
+
+static void syncProfileNames() {
+	for (int i = 0; i < 4; ++i)
+		g_app.playerName[i] = g_app.profileName[g_app.screenProfiles[i]];
+}
+
+static void commitProfileName() {
+	int profile = g_app.screenProfiles[g_app.editingIndex];
+	if (!g_app.editBuffer.empty()) g_app.profileName[profile] = g_app.editBuffer;
+	syncProfileNames();
+}
+
 static void loadSettings() {
 	FILE* f = fopen(settingsPath().c_str(), "r");
 	if (!f) {
@@ -936,6 +1079,7 @@ static void loadSettings() {
 }
 
 static void saveSettings() {
+	if (!saveProfiles()) fprintf(stderr, "Could not save profile settings\n");
 	FILE* f = fopen(settingsPath().c_str(), "w");
 	if (!f) {
 		return;
@@ -990,13 +1134,32 @@ static std::string linkPlayersInSio() {
 
 // Jemand ist im Link-Modus, aber Spieler 1 (der Bus-Master) fehlt?
 static bool linkNeedsMaster() {
-	if (!g_app.linked || g_app.numPlayers < 2) {
-		return false;
+	for (int c = 0; c < g_app.cableCount; ++c) {
+		const auto& screens = g_app.cables[c].screens;
+		bool active = false;
+		for (int screen : screens) {
+			auto* gba = static_cast<struct GBA*>(g_players[screen].core->board);
+			active |= gba->sio.mode == SIO_MULTI || gba->sio.mode == SIO_NORMAL_32;
+		}
+		auto* master = static_cast<struct GBA*>(g_players[screens[0]].core->board);
+		if (active && master->sio.mode != SIO_MULTI && master->sio.mode != SIO_NORMAL_32)
+			return true;
 	}
-	struct GBA* master = static_cast<struct GBA*>(g_players[0].core->board);
-	bool masterInSio = master->sio.mode == SIO_MULTI || master->sio.mode == SIO_NORMAL_32;
-	std::string active = linkPlayersInSio();
-	return !active.empty() && !masterInSio;
+	return false;
+}
+
+static std::string cableSummary() {
+	std::string text;
+	for (int c = 0; c < g_app.cableCount; ++c) {
+		if (c) text += " / ";
+		text += char('A' + c);
+		text += ":";
+		for (int screen : g_app.cables[c].screens) {
+			if (screen != g_app.cables[c].screens.front()) text += "+";
+			text += g_app.playerName[screen];
+		}
+	}
+	return text;
 }
 
 static void setMenuStatus(const std::string& s) {
@@ -1193,7 +1356,7 @@ static void menuHandleKey(const SDL_KeyboardEvent& ev, bool* quit) {
 
 	if (g_app.editingName) {
 		if (key == SDLK_RETURN || key == SDLK_KP_ENTER) {
-			g_app.playerName[g_app.editingIndex] = g_app.editBuffer;
+			commitProfileName();
 			g_app.editingName = false;
 			SDL_StopTextInput();
 		} else if (key == SDLK_ESCAPE) {
@@ -1406,9 +1569,9 @@ static std::string hudLine() {
 	hudAppend(line, speed);
 	if (g_app.linked) {
 		std::string active = linkPlayersInSio();
-		hudAppend(line, active.empty() ? "LINK" : "LINK " + active);
+		hudAppend(line, "LINK " + cableSummary());
 		if (linkNeedsMaster()) {
-			hudAppend(line, tr(S_HUD_P1_JOIN));
+			hudAppend(line, "! CABLE MASTER MUST JOIN !");
 		}
 	}
 	if (g_app.masterMute.load() && !g_app.recording) {
@@ -1474,11 +1637,11 @@ static void menuItemText(int id, std::string& label, std::string& value) {
 		} else {
 			std::string active = linkPlayersInSio();
 			if (active.empty()) {
-				value = trFmt(S_LINK_READY_FMT, g_app.numPlayers);
+				value = cableSummary();
 			} else if (linkNeedsMaster()) {
-				value = active + tr(S_LINK_P1_SUFFIX);
+				value = cableSummary() + " MASTER MUST JOIN";
 			} else {
-				value = active + tr(S_LINK_ACTIVE_SUFFIX);
+				value = cableSummary();
 			}
 		}
 	} else if (id == MI_PADS) {
@@ -1652,7 +1815,9 @@ static void drawHelp(int outW, int outH) {
 enum LauncherRow {
 	LR_PLAYERS = 100,
 	LR_P0 = 0, LR_P1, LR_P2, LR_P3,
-	LR_START = 200, LR_PADS, LR_CONTROLS, LR_QUIT,
+	LR_START = 200, LR_PADS, LR_CONTROLS, LR_QUIT, LR_LINK,
+	LR_PROFILE0 = 300, LR_PROFILE1, LR_PROFILE2, LR_PROFILE3,
+	LR_CABLE0 = 400, LR_CABLE1, LR_CABLE2, LR_CABLE3,
 };
 
 static std::string romDisplayName(const std::string& path) {
@@ -1717,6 +1882,12 @@ static std::vector<int> launcherRows() {
 		rows.push_back(LR_PLAYERS);
 		for (int i = 0; i < g_app.launcherPlayers; ++i) {
 			rows.push_back(LR_P0 + i);
+			rows.push_back(LR_PROFILE0 + i);
+		}
+		rows.push_back(LR_LINK);
+		if (g_app.linkMode == 1 || g_app.linkMode == 3) {
+			int count = g_app.linkMode == 1 ? 2 : 4;
+			for (int i = 0; i < count; ++i) rows.push_back(LR_CABLE0 + i);
 		}
 		rows.push_back(LR_START);
 	}
@@ -1733,8 +1904,16 @@ static void launcherNav(int dir) {
 }
 
 static void launcherAdjust(int row, int dir) {
+	g_app.menuStatus.clear();
 	if (row == LR_PLAYERS) {
 		g_app.launcherPlayers = std::clamp(g_app.launcherPlayers + dir, 1, MAX_PLAYERS);
+	} else if (row == LR_LINK) {
+		g_app.linkMode = (g_app.linkMode + dir + 4) % 4;
+	} else if (row >= LR_PROFILE0 && row <= LR_PROFILE3) {
+		session::cycleAssignment(g_app.screenProfiles, row - LR_PROFILE0, dir);
+		syncProfileNames();
+	} else if (row >= LR_CABLE0 && row <= LR_CABLE3) {
+		session::cycleAssignment(g_app.cableProfiles, row - LR_CABLE0, dir);
 	} else if (row >= LR_P0 && row <= LR_P3) {
 		int i = row - LR_P0;
 		int n = (int)g_app.romList.size();
@@ -1745,6 +1924,11 @@ static void launcherAdjust(int row, int dir) {
 // Rueckgabe: 0 = weiter im Menue, 1 = starten, 2 = beenden
 static int launcherActivate(int row) {
 	if (row == LR_START) {
+		if (g_app.linkEnabled && !session::validLink(g_app.launcherPlayers, g_app.screenProfiles,
+		                       g_app.linkMode, g_app.cableProfiles)) {
+			g_app.menuStatus = "SELECT ACTIVE PROFILES FOR EACH CABLE";
+			return 0;
+		}
 		return 1;
 	}
 	if (row == LR_QUIT) {
@@ -1755,12 +1939,14 @@ static int launcherActivate(int row) {
 		g_app.padAssignSel = 0;
 	} else if (row == LR_CONTROLS) {
 		g_app.helpOpen = true;
-	} else if (row >= LR_P0 && row <= LR_P3) {
+	} else if (row >= LR_PROFILE0 && row <= LR_PROFILE3) {
 		g_app.editingName = true;
-		g_app.editingIndex = row - LR_P0;
+		g_app.editingIndex = row - LR_PROFILE0;
 		g_app.editBuffer = g_app.playerName[g_app.editingIndex];
 		SDL_StartTextInput();
-	} else if (row == LR_PLAYERS) {
+	} else if (row == LR_PLAYERS || row == LR_LINK ||
+	           (row >= LR_P0 && row <= LR_P3) ||
+	           (row >= LR_CABLE0 && row <= LR_CABLE3)) {
 		launcherAdjust(row, +1);
 	}
 	return 0;
@@ -1785,11 +1971,11 @@ static void drawLauncher(int outW, int outH) {
 		g_app.launcherSel = 0;
 	}
 
-	int scale = std::max(2, outH / 400);
+	int scale = std::max(1, std::min(std::max(2, outH / 400), (outH * 3 / 4) / (int(rows.size() + 2) * (splitfont::GLYPH_H + 5))));
 	int rowH = (splitfont::GLYPH_H + 5) * scale;
-	int panelW = 52 * splitfont::ADVANCE * scale;
+	int panelW = 66 * splitfont::ADVANCE * scale;
 	int px = (outW - panelW) / 2;
-	int y = outH / 3;
+	int y = outH / 5;
 
 	if (g_app.romList.empty()) {
 		std::string msg = tr(S_NO_ROMS);
@@ -1817,17 +2003,20 @@ static void drawLauncher(int outW, int outH) {
 			drawText("P" + std::to_string(i + 1), tx, y, scale, r, g, b);
 			std::string rom = "< " + romDisplayName(g_app.romList[g_app.launcherRom[i]]) + " >";
 			drawText(rom, tx + 4 * splitfont::ADVANCE * scale, y, scale, r, g, b);
-			std::string name;
-			if (g_app.editingName && g_app.editingIndex == i) {
-				name = g_app.editBuffer + ((SDL_GetTicks64() / 400) % 2 ? "_" : " ");
-			} else {
-				name = g_app.playerName[i].empty() ? "---" : g_app.playerName[i];
-			}
-			drawText(name, tx + 27 * splitfont::ADVANCE * scale, y, scale, r, g, b);
-			if (g_players[i].pad) {
-				drawText(tr(S_PAD_OK), tx + 40 * splitfont::ADVANCE * scale, y, scale,
-				         120, 200, 120);
-			}
+		} else if (row >= LR_PROFILE0 && row <= LR_PROFILE3) {
+			int i = row - LR_PROFILE0;
+			std::string name = g_app.editingName && g_app.editingIndex == i
+			    ? g_app.editBuffer + "_" : g_app.playerName[i];
+			drawText("  PROFILE < " + name + " >  ENTER: RENAME", tx, y, scale, r, g, b);
+		} else if (row == LR_LINK) {
+			const char* modes[] = {"OFF", "2P", "4P", "2 + 2"};
+			drawText(std::string("LINK CABLE < ") + modes[g_app.linkMode] + " >", tx, y, scale, r, g, b);
+		} else if (row >= LR_CABLE0 && row <= LR_CABLE3) {
+			int i = row - LR_CABLE0;
+			std::string label = std::string("  CABLE ") + char('A' + i / 2) +
+			    (i % 2 ? " PARTNER" : " MASTER") + " < " +
+			    g_app.profileName[g_app.cableProfiles[i]] + " >";
+			drawText(label, tx, y, scale, r, g, b);
 		} else if (row == LR_START) {
 			drawText(tr(S_START), tx, y, scale, r, g, b);
 		} else if (row == LR_PADS) {
@@ -1840,7 +2029,7 @@ static void drawLauncher(int outW, int outH) {
 		y += rowH;
 	}
 
-	std::string hint = tr(g_app.editingName ? S_MENU_HINT_EDIT : S_LAUNCH_HINT);
+	std::string hint = g_app.menuStatus.empty() ? tr(g_app.editingName ? S_MENU_HINT_EDIT : S_LAUNCH_HINT) : g_app.menuStatus;
 	int hs = std::max(1, scale - 1);
 	drawText(hint, (outW - textWidth(hint, hs)) / 2, outH - rowH * 2, hs, 150, 150, 160);
 
@@ -1928,7 +2117,7 @@ static bool runLauncher(std::vector<std::string>* romsOut) {
 			if (g_app.editingName && ev.type == SDL_KEYDOWN) {
 				SDL_Keycode key = ev.key.keysym.sym;
 				if (key == SDLK_RETURN || key == SDLK_KP_ENTER) {
-					g_app.playerName[g_app.editingIndex] = g_app.editBuffer;
+					commitProfileName();
 					g_app.editingName = false;
 					SDL_StopTextInput();
 				} else if (key == SDLK_ESCAPE) {
@@ -1962,7 +2151,7 @@ static bool runLauncher(std::vector<std::string>* romsOut) {
 				case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: launcherAdjust(row, +1); break;
 				case SDL_CONTROLLER_BUTTON_A: action = launcherActivate(row); break;
 				case SDL_CONTROLLER_BUTTON_START:
-					action = g_app.romList.empty() ? 0 : 1;
+					action = g_app.romList.empty() ? 0 : launcherActivate(LR_START);
 					break;
 				default: break;
 				}
@@ -2339,6 +2528,11 @@ int main(int argc, char** argv) {
 	mLogSetDefaultLogger(&s_logger);
 
 	loadSettings();
+	if (!loadProfiles()) {
+		fprintf(stderr, "Cannot read profile settings; refusing to change save bindings\n");
+		return 1;
+	}
+	syncProfileNames();
 	g_app.linkEnabled = !args.noLink;
 	if (args.smooth) {
 		g_app.smooth = true;
@@ -2433,6 +2627,16 @@ int main(int argc, char** argv) {
 		}
 	}
 
+	if (g_app.linkEnabled && !session::validLink((int)args.roms.size(), g_app.screenProfiles,
+	                       g_app.linkMode, g_app.cableProfiles)) {
+		fprintf(stderr, "Link configuration requires active, distinct profiles\n");
+		SDL_Quit(); return 1;
+	}
+	for (const auto& rom : args.roms) registerProfileSaves(rom);
+	if (!saveProfiles()) {
+		fprintf(stderr, "Cannot persist save bindings; refusing to start\n");
+		SDL_Quit(); return 1;
+	}
 	// Doppelte ROM-Pfade erkennen: jeder Spieler bekommt eigenen Spielstand
 	g_app.numPlayers = (int)args.roms.size();
 	g_app.savedPlayers = g_app.numPlayers;  // fuers Startmenue beim naechsten Mal

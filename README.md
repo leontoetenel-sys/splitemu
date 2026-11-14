@@ -41,6 +41,58 @@ no second screen, no phones.
   (`game.p1.sav` … `game.p4.sav` are created automatically)
 - Audio mixing for all instances, solo/mute switching per player
 
+## Profiles and cable setup (fork)
+
+The launcher has a ROM row and a **PROFILE** row for every active screen.
+Use left/right on PROFILE to select a save owner; selecting a profile that is
+already assigned swaps the two profiles. Enter/A on PROFILE edits its visible
+name (up to 10 characters). Names appear in the existing screen overlay.
+Profiles remain independent of controller assignments and screen positions.
+
+On first use the four profiles represent the original save slots: SAVE 1 through
+SAVE 4, or the names from your existing settings. Rename SAVE 2 to HANNA if that
+was her window. For each ROM, profile 2 continues to use its original `.p2.sav`,
+even when shown on screen 1. Existing single-player `.sav` files are retained
+for their original profile. Renaming changes the display name, never the save
+contents or filename. Savestates also follow the profile's original slot.
+Do not rename/move the underlying save files separately.
+
+Set **LINK CABLE** before starting:
+
+| Mode | Connection |
+| --- | --- |
+| OFF | All screens play independently |
+| 2P | Select two active profiles: cable A master and partner; other screens stay unlinked |
+| 4P | All active screens share one cable, in screen order (up to four players) |
+| 2 + 2 | Four active profiles, two independent cables A and B, each with its own master |
+
+Use left/right on the cable rows to choose profiles. A profile cannot occur
+twice; changing a cable position swaps its previous occupant to the other
+position. The launcher refuses to start a pair configuration containing inactive
+profiles. The HUD identifies the cable groups; if it requests a master, the first
+profile on the corresponding cable must enter the Cable Club. Cable configuration
+cannot be changed during play. `--no-link` overrides the menu setting.
+
+ROM choices, profile assignments, names and cable groups are remembered. Profile
+metadata is stored next to `splitemu.ini` in `splitemu.ini.profiles`. Save bindings
+are recorded before emulation starts; a failed metadata write prevents starting.
+Keep this file with your settings. On Windows a `.bak` is retained when replacing
+it. If you move to another computer, existing `.p1.sav` through `.p4.sav` can be
+used with a fresh profile configuration on that computer.
+
+This fork does not modify the mGBA submodule. Cable isolation is tested with
+homebrew ROMs and identifiable data from every sender; Pokémon trading still
+needs a real-game check on your machine. Before trying the new build, back up
+your existing `.sav` / `.ss1` files and `splitemu.ini`.
+
+Run the profile, assignment and actual serial-transfer tests with:
+
+```sh
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
 ## Download
 
 Prebuilt packages for every release are on the

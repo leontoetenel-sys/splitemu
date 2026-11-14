@@ -28,6 +28,8 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build
+      - name: Profile and cable tests
+        run: ctest --test-dir build --output-on-failure
       - name: Smoke-Test
         run: |
           python3 tools/make_test_rom.py roms-test
