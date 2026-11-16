@@ -145,6 +145,7 @@ struct App {
 
 	// Controller-Zuweisung & Menue-Status
 	bool padAssignOpen = false;
+	bool padAssignWaiting = false;
 	int padAssignSel = 0;
 	std::string menuStatus;
 	uint64_t menuStatusUntil = 0;
@@ -153,6 +154,8 @@ struct App {
 	bool helpOpen = false;
 	int launcherPlayers = 4;
 	int launcherSel = 0;
+	int profilePickerScreen = -1;
+	int profilePickerSel = 0;
 	int launcherRom[MAX_PLAYERS] = {0, 0, 0, 0};
 	std::vector<std::string> romList;
 	int savedPlayers = 0;
@@ -1018,6 +1021,34 @@ static void syncProfileNames() {
 		g_app.playerName[i] = g_app.profileName[g_app.screenProfiles[i]];
 }
 
+static void swapControllers(int from, int target) {
+	if (from == target) return;
+	std::swap(g_players[from].pad, g_players[target].pad);
+	std::swap(g_players[from].padId, g_players[target].padId);
+	g_players[from].padKeys = 0;
+	g_players[target].padKeys = 0;
+}
+
+static void selectScreenProfile(int screen, int profile) {
+	int other = int(std::find(g_app.screenProfiles.begin(), g_app.screenProfiles.end(), profile)
+	                - g_app.screenProfiles.begin());
+	if (screen < 0 || screen >= MAX_PLAYERS || other >= MAX_PLAYERS) return;
+	std::swap(g_app.screenProfiles[screen], g_app.screenProfiles[other]);
+	swapControllers(screen, other);
+	syncProfileNames();
+	g_app.menuStatus.clear();
+}
+
+static const char* uiText(const char* en, const char* de) {
+	return g_app.lang.load() == 1 ? de : en;
+}
+
+static void openPadAssign() {
+	g_app.padAssignOpen = true;
+	g_app.padAssignWaiting = false;
+	g_app.padAssignSel = 0;
+}
+
 static void commitProfileName() {
 	int profile = g_app.screenProfiles[g_app.editingIndex];
 	if (!g_app.editBuffer.empty()) g_app.profileName[profile] = g_app.editBuffer;
@@ -1284,8 +1315,7 @@ static void menuActivate(int id, bool* quit) {
 		loadAllStates();
 		setMenuStatus(tr(S_STATES_LOADED));
 	} else if (id == MI_PADS) {
-		g_app.padAssignOpen = true;
-		g_app.padAssignSel = 0;
+		openPadAssign();
 	} else if (id == MI_CONTROLS) {
 		g_app.helpOpen = true;
 	} else if (id == MI_LINKINFO) {
@@ -1306,28 +1336,14 @@ static int padAssignPlayerCount() {
 	return g_app.numPlayers > 0 ? g_app.numPlayers : g_app.launcherPlayers;
 }
 
-static void padAssignHandleButton(SDL_JoystickID which) {
-	int target = g_app.padAssignSel;
-	int from = -1;
-	for (int i = 0; i < MAX_PLAYERS; ++i) {
-		if (g_players[i].padId == which && g_players[i].pad) {
-			from = i;
-		}
-	}
-	if (from < 0) {
-		return;
-	}
-	if (from != target) {
-		std::swap(g_players[from].pad, g_players[target].pad);
-		std::swap(g_players[from].padId, g_players[target].padId);
-		g_players[from].padKeys = 0;
-		g_players[target].padKeys = 0;
-	}
-	g_app.padAssignSel = (g_app.padAssignSel + 1) % padAssignPlayerCount();
-}
-
 static void padAssignHandleKey(const SDL_KeyboardEvent& ev) {
 	int count = padAssignPlayerCount();
+	if (ev.keysym.sym == SDLK_ESCAPE) {
+		if (g_app.padAssignWaiting) g_app.padAssignWaiting = false;
+		else g_app.padAssignOpen = false;
+		return;
+	}
+	if (g_app.padAssignWaiting) return; // Only a controller's A can claim the slot.
 	switch (ev.keysym.sym) {
 	case SDLK_UP:
 		g_app.padAssignSel = (g_app.padAssignSel + count - 1) % count;
@@ -1335,13 +1351,36 @@ static void padAssignHandleKey(const SDL_KeyboardEvent& ev) {
 	case SDLK_DOWN:
 		g_app.padAssignSel = (g_app.padAssignSel + 1) % count;
 		break;
-	case SDLK_ESCAPE:
 	case SDLK_RETURN:
 	case SDLK_KP_ENTER:
-		g_app.padAssignOpen = false;
+		if (!ev.repeat) g_app.padAssignWaiting = true;
 		break;
-	default:
-		break;
+	default: break;
+	}
+}
+
+static void padAssignHandleButton(const SDL_ControllerButtonEvent& ev) {
+	if (ev.button == SDL_CONTROLLER_BUTTON_B) {
+		SDL_KeyboardEvent back = {}; back.keysym.sym = SDLK_ESCAPE;
+		padAssignHandleKey(back);
+		return;
+	}
+	if (!g_app.padAssignWaiting) {
+		SDL_KeyboardEvent key = {};
+		if (ev.button == SDL_CONTROLLER_BUTTON_DPAD_UP) key.keysym.sym = SDLK_UP;
+		else if (ev.button == SDL_CONTROLLER_BUTTON_DPAD_DOWN) key.keysym.sym = SDLK_DOWN;
+		else if (ev.button == SDL_CONTROLLER_BUTTON_A) key.keysym.sym = SDLK_RETURN;
+		else return;
+		padAssignHandleKey(key);
+		return; // Opening A is consumed; the next A chooses the controller.
+	}
+	if (ev.button != SDL_CONTROLLER_BUTTON_A) return;
+	for (int from = 0; from < MAX_PLAYERS; ++from) {
+		if (g_players[from].pad && g_players[from].padId == ev.which) {
+			swapControllers(from, g_app.padAssignSel);
+			g_app.padAssignWaiting = false;
+			return;
+		}
 	}
 }
 
@@ -1401,7 +1440,12 @@ static void menuHandleKey(const SDL_KeyboardEvent& ev, bool* quit) {
 
 static void menuHandlePad(const SDL_ControllerButtonEvent& ev, bool* quit) {
 	if (g_app.editingName) {
-		return;  // Namen nur per Tastatur
+		if (ev.button == SDL_CONTROLLER_BUTTON_B || ev.button == SDL_CONTROLLER_BUTTON_A) {
+			SDL_KeyboardEvent key = {};
+			key.keysym.sym = ev.button == SDL_CONTROLLER_BUTTON_B ? SDLK_ESCAPE : SDLK_RETURN;
+			menuHandleKey(key, quit);
+		}
+		return;
 	}
 	std::vector<int> items = menuItems();
 	if (g_app.menuSel >= (int)items.size()) {
@@ -1763,14 +1807,21 @@ static void drawPadAssign(int outW, int outH) {
 	}
 
 	int hs = std::max(1, scale - 1);
-	std::string hint1 = tr(S_PADS_HINT1);
-	std::string hint2 = tr(S_PADS_HINT2);
-	std::string hint3 = tr(S_PADS_HINT3);
+	std::string hint1 = uiText("D-PAD: SELECT PROFILE   A/ENTER: CHANGE", "STEUERKREUZ: PROFIL   A/ENTER: AENDERN");
+	std::string hint2 = uiText("B/ESC: BACK", "B/ESC: ZURUECK");
 	drawText(hint1, px + (panelW - textWidth(hint1, hs)) / 2, y + rowH / 2, hs, 150, 150, 160);
-	drawText(hint2, px + (panelW - textWidth(hint2, hs)) / 2, y + rowH / 2 + rowH, hs,
-	         150, 150, 160);
-	drawText(hint3, px + (panelW - textWidth(hint3, hs)) / 2, y + rowH / 2 + rowH * 2, hs,
-	         150, 150, 160);
+	drawText(hint2, px + (panelW - textWidth(hint2, hs)) / 2, y + rowH / 2 + rowH, hs, 150, 150, 160);
+	if (g_app.padAssignWaiting) {
+		int h = rowH * 5, top = (outH - h) / 2;
+		fillRect(px, top, panelW, h, 24, 24, 36, 255);
+		std::string title = g_app.playerName[g_app.padAssignSel];
+		std::string prompt = uiText("PRESS A TO SELECT A CONTROLLER", "A DRUECKEN UM CONTROLLER ZU WAEHLEN");
+		std::string back = uiText("B/ESC: CANCEL", "B/ESC: ABBRECHEN");
+		drawText(title, (outW - textWidth(title, scale)) / 2, top + rowH, scale, 120, 200, 255);
+		drawText(prompt, (outW - textWidth(prompt, scale)) / 2, top + rowH * 2, scale, 255, 220, 120);
+		drawText(back, (outW - textWidth(back, hs)) / 2, top + rowH * 4, hs, 180, 180, 190);
+	}
+
 }
 
 // ---------------------------------------------------------------------------
@@ -1910,8 +1961,8 @@ static void launcherAdjust(int row, int dir) {
 	} else if (row == LR_LINK) {
 		g_app.linkMode = (g_app.linkMode + dir + 4) % 4;
 	} else if (row >= LR_PROFILE0 && row <= LR_PROFILE3) {
-		session::cycleAssignment(g_app.screenProfiles, row - LR_PROFILE0, dir);
-		syncProfileNames();
+		int screen = row - LR_PROFILE0;
+		selectScreenProfile(screen, (g_app.screenProfiles[screen] + dir + 4) % 4);
 	} else if (row >= LR_CABLE0 && row <= LR_CABLE3) {
 		session::cycleAssignment(g_app.cableProfiles, row - LR_CABLE0, dir);
 	} else if (row >= LR_P0 && row <= LR_P3) {
@@ -1935,21 +1986,127 @@ static int launcherActivate(int row) {
 		return 2;
 	}
 	if (row == LR_PADS) {
-		g_app.padAssignOpen = true;
-		g_app.padAssignSel = 0;
+		openPadAssign();
 	} else if (row == LR_CONTROLS) {
 		g_app.helpOpen = true;
 	} else if (row >= LR_PROFILE0 && row <= LR_PROFILE3) {
-		g_app.editingName = true;
-		g_app.editingIndex = row - LR_PROFILE0;
-		g_app.editBuffer = g_app.playerName[g_app.editingIndex];
-		SDL_StartTextInput();
+		g_app.profilePickerScreen = row - LR_PROFILE0;
+		g_app.profilePickerSel = g_app.screenProfiles[g_app.profilePickerScreen];
 	} else if (row == LR_PLAYERS || row == LR_LINK ||
 	           (row >= LR_P0 && row <= LR_P3) ||
 	           (row >= LR_CABLE0 && row <= LR_CABLE3)) {
 		launcherAdjust(row, +1);
 	}
 	return 0;
+}
+
+static void profilePickerHandleKey(const SDL_KeyboardEvent& ev) {
+	if (ev.keysym.sym == SDLK_ESCAPE) { g_app.profilePickerScreen = -1; return; }
+	if (ev.keysym.sym == SDLK_UP)
+		g_app.profilePickerSel = (g_app.profilePickerSel + 4) % 5;
+	else if (ev.keysym.sym == SDLK_DOWN)
+		g_app.profilePickerSel = (g_app.profilePickerSel + 1) % 5;
+	else if ((ev.keysym.sym == SDLK_RETURN || ev.keysym.sym == SDLK_KP_ENTER) && !ev.repeat) {
+		int screen = g_app.profilePickerScreen;
+		if (g_app.profilePickerSel < 4) {
+			selectScreenProfile(screen, g_app.profilePickerSel);
+			g_app.profilePickerScreen = -1;
+		} else {
+			g_app.editingName = true;
+			g_app.editingIndex = screen;
+			g_app.editBuffer = g_app.playerName[screen];
+			SDL_StartTextInput();
+		}
+	}
+}
+
+// Same navigation keys for every controller-driven menu; gameplay is unaffected.
+static SDL_Keycode menuPadKey(Uint8 button) {
+	switch (button) {
+	case SDL_CONTROLLER_BUTTON_A: return SDLK_RETURN;
+	case SDL_CONTROLLER_BUTTON_B: return SDLK_ESCAPE;
+	case SDL_CONTROLLER_BUTTON_DPAD_UP: return SDLK_UP;
+	case SDL_CONTROLLER_BUTTON_DPAD_DOWN: return SDLK_DOWN;
+	case SDL_CONTROLLER_BUTTON_DPAD_LEFT: return SDLK_LEFT;
+	case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: return SDLK_RIGHT;
+	default: return SDLK_UNKNOWN;
+	}
+}
+
+static int launcherHandleEvent(const SDL_Event& ev) {
+	if (ev.type == SDL_QUIT) return 2;
+	if (ev.type == SDL_CONTROLLERDEVICEADDED) { assignController(ev.cdevice.which); return 0; }
+	if (ev.type == SDL_CONTROLLERDEVICEREMOVED) { removeController(ev.cdevice.which); return 0; }
+	if (ev.type == SDL_TEXTINPUT) { menuHandleText(ev.text); return 0; }
+	if (g_app.helpOpen) {
+		if (ev.type == SDL_KEYDOWN || ev.type == SDL_CONTROLLERBUTTONDOWN) g_app.helpOpen = false;
+		return 0;
+	}
+	if (g_app.padAssignOpen) {
+		if (ev.type == SDL_KEYDOWN) padAssignHandleKey(ev.key);
+		else if (ev.type == SDL_CONTROLLERBUTTONDOWN) padAssignHandleButton(ev.cbutton);
+		return 0;
+	}
+	SDL_KeyboardEvent key = {};
+	if (ev.type == SDL_KEYDOWN) key = ev.key;
+	else if (ev.type == SDL_CONTROLLERBUTTONDOWN) key.keysym.sym = menuPadKey(ev.cbutton.button);
+	else return 0;
+	if (g_app.editingName) {
+		bool unused = false;
+		menuHandleKey(key, &unused);
+		return 0;
+	}
+	if (g_app.profilePickerScreen >= 0) { profilePickerHandleKey(key); return 0; }
+	if (ev.type == SDL_CONTROLLERBUTTONDOWN && ev.cbutton.button == SDL_CONTROLLER_BUTTON_START)
+		return g_app.romList.empty() ? 0 : launcherActivate(LR_START);
+	auto rows = launcherRows();
+	int row = rows[std::min(g_app.launcherSel, (int)rows.size() - 1)];
+	switch (key.keysym.sym) {
+	case SDLK_UP: launcherNav(-1); break;
+	case SDLK_DOWN: launcherNav(+1); break;
+	case SDLK_LEFT: launcherAdjust(row, -1); break;
+	case SDLK_RIGHT: launcherAdjust(row, +1); break;
+	case SDLK_RETURN:
+	case SDLK_KP_ENTER: if (!key.repeat) return launcherActivate(row); break;
+	case SDLK_ESCAPE: return 2;
+	case SDLK_f: toggleFullscreen(); break;
+	default: break;
+	}
+	return 0;
+}
+
+static void drawProfilePicker(int outW, int outH) {
+	int scale = std::max(2, outH / 400);
+	int rowH = (splitfont::GLYPH_H + 6) * scale;
+	int width = 48 * splitfont::ADVANCE * scale;
+	int height = rowH * 9;
+	int x = (outW - width) / 2, y = (outH - height) / 2;
+	fillRect(x, y, width, height, 24, 24, 36, 255);
+	std::string title = std::string(uiText("PROFILE FOR SCREEN P", "PROFIL FUER BILDSCHIRM P")) +
+	                    std::to_string(g_app.profilePickerScreen + 1);
+	drawText(title, x + 12 * scale, y + rowH / 2, scale, 120, 200, 255);
+	for (int i = 0; i < 5; ++i) {
+		int top = y + rowH * (i + 2);
+		bool selected = i == g_app.profilePickerSel;
+		if (selected) fillRect(x + 8 * scale, top - 2 * scale, width - 16 * scale, rowH, 60, 60, 80, 255);
+		std::string label;
+		if (i < 4) {
+			int slot = int(std::find(g_app.screenProfiles.begin(), g_app.screenProfiles.end(), i) - g_app.screenProfiles.begin());
+			label = g_app.profileName[i] + "  (P" + std::to_string(slot + 1) + ")";
+		} else {
+			label = std::string(uiText("RENAME: ", "UMBENENNEN: ")) + g_app.playerName[g_app.profilePickerScreen];
+		}
+		if (selected) label = "> " + label;
+		drawText(label, x + 12 * scale, top, scale, selected ? 255 : 200, selected ? 220 : 200, selected ? 120 : 205);
+	}
+	std::string hint = uiText("A/ENTER: SELECT   B/ESC: BACK", "A/ENTER: WAEHLEN   B/ESC: ZURUECK");
+	drawText(hint, x + 12 * scale, y + rowH * 8, std::max(1, scale - 1), 180, 180, 190);
+	if (g_app.editingName) {
+		fillRect(x, y + rowH * 2, width, rowH * 5, 24, 24, 36, 255);
+		drawText(g_app.editBuffer + "_", x + 12 * scale, y + rowH * 3, scale, 255, 220, 120);
+		std::string editHint = uiText("TYPE NAME  A/ENTER: SAVE  B/ESC: CANCEL", "NAME TIPPEN  A/ENTER: OK  B/ESC: ABBRUCH");
+		drawText(editHint, x + 12 * scale, y + rowH * 5, std::max(1, scale - 1), 180, 180, 190);
+	}
 }
 
 static void drawLauncher(int outW, int outH) {
@@ -2007,7 +2164,7 @@ static void drawLauncher(int outW, int outH) {
 			int i = row - LR_PROFILE0;
 			std::string name = g_app.editingName && g_app.editingIndex == i
 			    ? g_app.editBuffer + "_" : g_app.playerName[i];
-			drawText("  PROFILE < " + name + " >  ENTER: RENAME", tx, y, scale, r, g, b);
+			drawText("  PROFILE < " + name + " >  A/ENTER: SELECT", tx, y, scale, r, g, b);
 		} else if (row == LR_LINK) {
 			const char* modes[] = {"OFF", "2P", "4P", "2 + 2"};
 			drawText(std::string("LINK CABLE < ") + modes[g_app.linkMode] + " >", tx, y, scale, r, g, b);
@@ -2033,6 +2190,7 @@ static void drawLauncher(int outW, int outH) {
 	int hs = std::max(1, scale - 1);
 	drawText(hint, (outW - textWidth(hint, hs)) / 2, outH - rowH * 2, hs, 150, 150, 160);
 
+	if (g_app.profilePickerScreen >= 0) drawProfilePicker(outW, outH);
 	if (g_app.padAssignOpen) {
 		drawPadAssign(outW, outH);
 	}
@@ -2075,6 +2233,13 @@ static bool runLauncher(std::vector<std::string>* romsOut) {
 		if (getenv("SPLITEMU_LAUNCHER_SHOT_PADS")) {
 			g_app.padAssignOpen = true;
 		}
+		if (getenv("SPLITEMU_LAUNCHER_SHOT_PROFILE")) {
+			g_app.profilePickerScreen = 0;
+			g_app.profilePickerSel = g_app.screenProfiles[0];
+		}
+		if (getenv("SPLITEMU_LAUNCHER_SHOT_CAPTURE")) {
+			openPadAssign(); g_app.padAssignWaiting = true;
+		}
 		drawLauncher(outW, outH);
 		saveScreenshotBMP(shotPath);
 		printf("Startmenue-Screenshot: %s\n", shotPath);
@@ -2085,77 +2250,7 @@ static bool runLauncher(std::vector<std::string>* romsOut) {
 	while (!done) {
 		SDL_Event ev;
 		while (SDL_PollEvent(&ev)) {
-			if (ev.type == SDL_QUIT) {
-				return false;
-			}
-			if (ev.type == SDL_CONTROLLERDEVICEADDED) {
-				assignController(ev.cdevice.which);
-				continue;
-			}
-			if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
-				removeController(ev.cdevice.which);
-				continue;
-			}
-			if (ev.type == SDL_TEXTINPUT) {
-				menuHandleText(ev.text);
-				continue;
-			}
-			if (g_app.helpOpen) {
-				if (ev.type == SDL_KEYDOWN || ev.type == SDL_CONTROLLERBUTTONDOWN) {
-					g_app.helpOpen = false;
-				}
-				continue;
-			}
-			if (g_app.padAssignOpen) {
-				if (ev.type == SDL_KEYDOWN) {
-					padAssignHandleKey(ev.key);
-				} else if (ev.type == SDL_CONTROLLERBUTTONDOWN) {
-					padAssignHandleButton(ev.cbutton.which);
-				}
-				continue;
-			}
-			if (g_app.editingName && ev.type == SDL_KEYDOWN) {
-				SDL_Keycode key = ev.key.keysym.sym;
-				if (key == SDLK_RETURN || key == SDLK_KP_ENTER) {
-					commitProfileName();
-					g_app.editingName = false;
-					SDL_StopTextInput();
-				} else if (key == SDLK_ESCAPE) {
-					g_app.editingName = false;
-					SDL_StopTextInput();
-				} else if (key == SDLK_BACKSPACE && !g_app.editBuffer.empty()) {
-					g_app.editBuffer.pop_back();
-				}
-				continue;
-			}
-			int action = 0;
-			std::vector<int> rows = launcherRows();
-			int row = rows[std::min(g_app.launcherSel, (int)rows.size() - 1)];
-			if (ev.type == SDL_KEYDOWN) {
-				switch (ev.key.keysym.sym) {
-				case SDLK_UP: launcherNav(-1); break;
-				case SDLK_DOWN: launcherNav(+1); break;
-				case SDLK_LEFT: launcherAdjust(row, -1); break;
-				case SDLK_RIGHT: launcherAdjust(row, +1); break;
-				case SDLK_RETURN:
-				case SDLK_KP_ENTER: action = launcherActivate(row); break;
-				case SDLK_ESCAPE: action = 2; break;
-				case SDLK_f: toggleFullscreen(); break;
-				default: break;
-				}
-			} else if (ev.type == SDL_CONTROLLERBUTTONDOWN) {
-				switch (ev.cbutton.button) {
-				case SDL_CONTROLLER_BUTTON_DPAD_UP: launcherNav(-1); break;
-				case SDL_CONTROLLER_BUTTON_DPAD_DOWN: launcherNav(+1); break;
-				case SDL_CONTROLLER_BUTTON_DPAD_LEFT: launcherAdjust(row, -1); break;
-				case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: launcherAdjust(row, +1); break;
-				case SDL_CONTROLLER_BUTTON_A: action = launcherActivate(row); break;
-				case SDL_CONTROLLER_BUTTON_START:
-					action = g_app.romList.empty() ? 0 : launcherActivate(LR_START);
-					break;
-				default: break;
-				}
-			}
+			int action = launcherHandleEvent(ev);
 			if (action == 1) {
 				done = true;
 			} else if (action == 2) {
@@ -2773,7 +2868,7 @@ int main(int argc, char** argv) {
 				if (g_app.helpOpen) {
 					g_app.helpOpen = false;
 				} else if (g_app.padAssignOpen) {
-					padAssignHandleButton(ev.cbutton.which);
+					padAssignHandleButton(ev.cbutton);
 				} else if (g_app.menuOpen) {
 					menuHandlePad(ev.cbutton, &quit);
 				}

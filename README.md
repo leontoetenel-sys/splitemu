@@ -45,9 +45,14 @@ no second screen, no phones.
 
 The launcher has a ROM row and a **PROFILE** row for every active screen.
 Use left/right on PROFILE to select a save owner; selecting a profile that is
-already assigned swaps the two profiles. Enter/A on PROFILE edits its visible
-name (up to 10 characters). Names appear in the existing screen overlay.
-Profiles remain independent of controller assignments and screen positions.
+already assigned swaps the two profiles. Enter/A on PROFILE opens a list of all four profiles, showing their current
+screen positions. Select a name and confirm with A/Enter to swap it into this
+screen, together with its controller. The list also contains **RENAME**, which
+edits the currently assigned profile's visible name (up to 10 characters; typing
+requires a keyboard). B/Escape goes back one level or cancels name editing.
+Names appear in the existing screen overlay.
+Profiles keep their saves when changing screen position. Controllers follow the
+profile when you swap profiles in the launcher.
 
 On first use the four profiles represent the original save slots: SAVE 1 through
 SAVE 4, or the names from your existing settings. Rename SAVE 2 to HANNA if that
@@ -56,6 +61,15 @@ even when shown on screen 1. Existing single-player `.sav` files are retained
 for their original profile. Renaming changes the display name, never the save
 contents or filename. Savestates also follow the profile's original slot.
 Do not rename/move the underlying save files separately.
+
+In **ASSIGN CONTROLLERS**, use the D-pad/up/down to select a profile beside its
+controller name. A/Enter opens a **PRESS A TO SELECT A CONTROLLER** prompt. Only
+the next A press assigns the controller that sent it; other buttons cannot
+accidentally reassign it. If already assigned elsewhere, the two controllers
+swap. B/Escape cancels the prompt, then returns from the controller list. On the
+launcher itself B behaves exactly like Escape (quit). The controller-assignment
+flow also works from the in-game settings menu. Controller assignments are for
+the current session; hotplug/restart behaviour is unchanged.
 
 Set **LINK CABLE** before starting:
 
