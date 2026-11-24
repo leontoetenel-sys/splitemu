@@ -27,8 +27,16 @@ int main() {
         g_app.profileName[i]="PROFILE " + std::to_string(i+1);
     }
     syncProfileNames();
-    g_app.romList={"test.gba"};
+    g_app.romList={"test.gba", "translated.gba"};
     g_app.launcherPlayers=4;
+    assert(launcherRows().front() == LR_ROM_ALL);
+    button(SDL_CONTROLLER_BUTTON_DPAD_RIGHT, ids[0]);
+    assert(std::all_of(g_app.launcherRom, g_app.launcherRom + MAX_PLAYERS,
+                       [](int rom) { return rom == 1; }));
+    launcherAdjust(LR_P1, -1);
+    assert(!launcherUsesOneRom());
+    key(SDLK_RETURN);
+    assert(launcherUsesOneRom() && g_app.launcherRom[0] == 0);
     // Enter opens a picker; navigation/cancellation cannot change assignments.
     auto rows=launcherRows();
     g_app.launcherSel=int(std::find(rows.begin(),rows.end(),LR_PROFILE0)-rows.begin());

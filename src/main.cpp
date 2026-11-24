@@ -1866,7 +1866,7 @@ static void drawHelp(int outW, int outH) {
 enum LauncherRow {
 	LR_PLAYERS = 100,
 	LR_P0 = 0, LR_P1, LR_P2, LR_P3,
-	LR_START = 200, LR_PADS, LR_CONTROLS, LR_QUIT, LR_LINK,
+	LR_START = 200, LR_PADS, LR_CONTROLS, LR_QUIT, LR_LINK, LR_ROM_ALL,
 	LR_PROFILE0 = 300, LR_PROFILE1, LR_PROFILE2, LR_PROFILE3,
 	LR_CABLE0 = 400, LR_CABLE1, LR_CABLE2, LR_CABLE3,
 };
@@ -1886,6 +1886,12 @@ static bool isGbaFile(const fs::path& p) {
 	return ext == ".gba";
 }
 
+static fs::path romIdentity(const std::string& path) {
+	std::error_code ec;
+	fs::path resolved = fs::canonical(path, ec);
+	return ec ? fs::path(path) : resolved;
+}
+
 static void scanRoms() {
 	g_app.romList.clear();
 	std::vector<std::string> dirs = {"roms", "roms-test", "."};
@@ -1896,9 +1902,11 @@ static void scanRoms() {
 #endif
 	if (home) {
 		// fuer App-Bundle-Nutzer ohne Terminal: fester Ordner im Benutzerverzeichnis
+		dirs.push_back((fs::path(home) / "roms").string());
 		dirs.push_back((fs::path(home) / "SplitEmu").string());
 		dirs.push_back((fs::path(home) / "SplitGBA").string());  // alter Name
 	}
+	std::vector<fs::path> identities;
 	for (const std::string& dirname : dirs) {
 		std::error_code ec;
 		std::vector<std::string> found;
@@ -1911,7 +1919,11 @@ static void scanRoms() {
 		}
 		std::sort(found.begin(), found.end());
 		for (const auto& f : found) {
-			g_app.romList.push_back(f);
+			auto identity = romIdentity(f);
+			if (std::find(identities.begin(), identities.end(), identity) == identities.end()) {
+				identities.push_back(identity);
+				g_app.romList.push_back(f);
+			}
 		}
 	}
 	// Zuletzt benutzte Auswahl wiederherstellen
@@ -1919,17 +1931,16 @@ static void scanRoms() {
 		g_app.launcherPlayers = g_app.savedPlayers;
 	}
 	for (int i = 0; i < MAX_PLAYERS; ++i) {
-		for (int r = 0; r < (int)g_app.romList.size(); ++r) {
-			if (g_app.romList[r] == g_app.savedRomPath[i]) {
-				g_app.launcherRom[i] = r;
-			}
-		}
+		const auto saved = romIdentity(g_app.savedRomPath[i]);
+		auto match = std::find(identities.begin(), identities.end(), saved);
+		g_app.launcherRom[i] = match == identities.end() ? 0 : int(match - identities.begin());
 	}
 }
 
 static std::vector<int> launcherRows() {
 	std::vector<int> rows;
 	if (!g_app.romList.empty()) {
+		rows.push_back(LR_ROM_ALL);
 		rows.push_back(LR_PLAYERS);
 		for (int i = 0; i < g_app.launcherPlayers; ++i) {
 			rows.push_back(LR_P0 + i);
@@ -1954,10 +1965,20 @@ static void launcherNav(int dir) {
 	                    (int)rows.size();
 }
 
+static bool launcherUsesOneRom() {
+	return std::all_of(g_app.launcherRom, g_app.launcherRom + g_app.launcherPlayers,
+	                   [](int rom) { return rom == g_app.launcherRom[0]; });
+}
+
 static void launcherAdjust(int row, int dir) {
 	g_app.menuStatus.clear();
 	if (row == LR_PLAYERS) {
 		g_app.launcherPlayers = std::clamp(g_app.launcherPlayers + dir, 1, MAX_PLAYERS);
+	} else if (row == LR_ROM_ALL) {
+		int count = int(g_app.romList.size());
+		int current = launcherUsesOneRom() ? g_app.launcherRom[0] : (dir > 0 ? -1 : 0);
+		int next = (current + dir + count) % count;
+		std::fill_n(g_app.launcherRom, MAX_PLAYERS, next);
 	} else if (row == LR_LINK) {
 		g_app.linkMode = (g_app.linkMode + dir + 4) % 4;
 	} else if (row >= LR_PROFILE0 && row <= LR_PROFILE3) {
@@ -1992,7 +2013,7 @@ static int launcherActivate(int row) {
 	} else if (row >= LR_PROFILE0 && row <= LR_PROFILE3) {
 		g_app.profilePickerScreen = row - LR_PROFILE0;
 		g_app.profilePickerSel = g_app.screenProfiles[g_app.profilePickerScreen];
-	} else if (row == LR_PLAYERS || row == LR_LINK ||
+	} else if (row == LR_ROM_ALL || row == LR_PLAYERS || row == LR_LINK ||
 	           (row >= LR_P0 && row <= LR_P3) ||
 	           (row >= LR_CABLE0 && row <= LR_CABLE3)) {
 		launcherAdjust(row, +1);
@@ -2151,7 +2172,13 @@ static void drawLauncher(int outW, int outH) {
 			drawText(">", px + 2 * scale, y, scale, 255, 220, 120);
 		}
 		int tx = px + 4 * splitfont::ADVANCE * scale;
-		if (row == LR_PLAYERS) {
+		if (row == LR_ROM_ALL) {
+			std::string rom = launcherUsesOneRom()
+			    ? romDisplayName(g_app.romList[g_app.launcherRom[0]])
+			    : uiText("MIXED", "GEMISCHT");
+			std::string label = std::string(uiText("ROM FOR ALL", "ROM FUER ALLE")) + " < " + rom + " >";
+			drawText(label, tx, y, scale, r, g, b);
+		} else if (row == LR_PLAYERS) {
 			drawText(tr(S_PLAYERS), tx, y, scale, r, g, b);
 			std::string v = "< " + std::to_string(g_app.launcherPlayers) + " >";
 			drawText(v, tx + 20 * splitfont::ADVANCE * scale, y, scale, r, g, b);
